@@ -1,0 +1,158 @@
+# =============================================================================
+# CI reutilizable para microservicios con Dockerfile.
+#
+# Jobs:  prepare  ->  build_and_publish  ->  git_tagging
+#   prepare:            decide el ambiente por la rama y calcula el tag (av/bv/v)
+#   build_and_publish:  construye la imagen y la sube a ECR (con OIDC, sin contraseñas)
+#   git_tagging:        crea el tag Git en el repo de la app -> ESO dispara el CD
+# =============================================================================
+name: Docker CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      aws-account-id:
+        type: string
+        required: true
+      aws-region:
+        type: string
+        default: us-east-1
+      ecr-push-role-arn:
+        description: Rol IAM que GitHub asume para subir a ECR (output de lab-iac-do-ecr)
+        type: string
+        required: true
+      environment:
+        description: dev, qa, prod o default (default = se deduce de la rama)
+        type: string
+        default: default
+      dockerfile-path:
+        type: string
+        default: Dockerfile
+      git-user-name:
+        type: string
+        required: true
+      git-user-email:
+        type: string
+        required: true
+    secrets:
+      LAB_PAT_WRITE_CONTENT:
+        description: PAT con permiso de escritura para crear el tag (y que dispare el CD)
+        required: true
+    outputs:
+      environment:
+        value: ${{ jobs.prepare.outputs.environment }}
+      git-tag:
+        value: ${{ jobs.prepare.outputs.git-tag }}
+      image:
+        value: ${{ jobs.build_and_publish.outputs.image }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set_tags.outputs.ENVIRONMENT }}
+      git-tag: ${{ steps.set_tags.outputs.GIT_TAG }}
+    steps:
+      - name: Determine environment and git tag
+        id: set_tags
+        run: |
+          set -euo pipefail
+
+          # 1) Ambiente: el input manda; si es "default", se deduce de la rama.
+          if [ "${INPUT_ENVIRONMENT}" != "default" ]; then
+            environment="${INPUT_ENVIRONMENT}"
+          elif [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            environment="prod"
+          elif [[ "${GITHUB_REF}" == refs/heads/release/* ]]; then
+            environment="qa"
+          else
+            environment="dev"
+          fi
+
+          # 2) Prefijo del tag según el ambiente (misma convención que la empresa).
+          case "${environment}" in
+            prod) prefix="v"  ;;
+            qa)   prefix="bv" ;;
+            *)    prefix="av" ;;
+          esac
+
+          # 3) Tag: <prefijo><fecha>.<número de ejecución>, ej. av20261009.7
+          git_tag="${prefix}$(date -u +%Y%m%d).${GITHUB_RUN_NUMBER}"
+
+          echo "::notice::Rama: ${GITHUB_REF} -> ambiente: ${environment} -> tag: ${git_tag}"
+          echo "ENVIRONMENT=${environment}" >> "${GITHUB_OUTPUT}"
+          echo "GIT_TAG=${git_tag}" >> "${GITHUB_OUTPUT}"
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+
+  build_and_publish:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # necesario para pedir el token OIDC a GitHub
+      contents: read
+    outputs:
+      image: ${{ steps.build.outputs.IMAGE }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.ecr-push-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to Amazon ECR
+        id: ecr_login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${REPOSITORY_NAME}:${GIT_TAG}"
+
+          echo "::group::docker build"
+          docker build \
+            --build-arg APP_VERSION="${GIT_TAG}" \
+            -f "${DOCKERFILE_PATH}" \
+            -t "${image}" .
+          echo "::endgroup::"
+
+          echo "::group::docker push"
+          docker push "${image}"
+          echo "::endgroup::"
+
+          echo "::notice::Imagen publicada: ${image}"
+          echo "IMAGE=${image}" >> "${GITHUB_OUTPUT}"
+        env:
+          DOCKERFILE_PATH: ${{ inputs.dockerfile-path }}
+          GIT_TAG: ${{ needs.prepare.outputs.git-tag }}
+          REGISTRY: ${{ steps.ecr_login.outputs.registry }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+
+  git_tagging:
+    needs: [prepare, build_and_publish]
+    runs-on: ubuntu-latest
+    steps:
+      # Se usa el PAT (no el GITHUB_TOKEN) porque los eventos creados con
+      # GITHUB_TOKEN NO disparan otros workflows, y necesitamos que el tag
+      # dispare el workflow de CD.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.LAB_PAT_WRITE_CONTENT }}
+
+      - name: Create and push git tag
+        run: |
+          set -euo pipefail
+          git config user.name "${GIT_USER_NAME}"
+          git config user.email "${GIT_USER_EMAIL}"
+          git tag -a "${GIT_TAG}" -m "Release ${GIT_TAG}" "${GITHUB_SHA}"
+          git push origin "${GIT_TAG}"
+          echo "::notice::Tag ${GIT_TAG} creado. Esto dispara el workflow de CD."
+        env:
+          GIT_TAG: ${{ needs.prepare.outputs.git-tag }}
+          GIT_USER_EMAIL: ${{ inputs.git-user-email }}
+          GIT_USER_NAME: ${{ inputs.git-user-name }}

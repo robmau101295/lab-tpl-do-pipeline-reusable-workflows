@@ -1,0 +1,110 @@
+# =============================================================================
+# Actualiza el tag de la imagen en el repo GitOps (el "puente" CD -> Argo CD).
+#
+# Edita <repo-de-la-app>/<ambiente>/app.yaml -> container.image.tag = <tag>
+# y hace commit + push. A partir de ahí, Argo CD detecta el commit y despliega.
+# =============================================================================
+name: Sync tag to GitOps repository (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      gitops-repository:
+        description: Repo GitOps en formato dueño/nombre (ej. tu-usuario/lab-cfg-dm-argo-cd)
+        type: string
+        required: true
+      gitops-branch:
+        type: string
+        default: main
+      git-user-name:
+        type: string
+        required: true
+      git-user-email:
+        type: string
+        required: true
+    secrets:
+      LAB_PAT_WRITE_CONTENT:
+        required: true
+
+jobs:
+  sync_tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops-repository }}
+          ref: ${{ inputs.gitops-branch }}
+          token: ${{ secrets.LAB_PAT_WRITE_CONTENT }}
+          path: gitops
+
+      - name: Update image tag in app.yaml
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+          file_path="${REPOSITORY_NAME}/${ENVIRONMENT}/app.yaml"
+
+          if [ ! -f "${file_path}" ]; then
+            echo "::error::No existe ${file_path} en el repo GitOps. Créalo primero."
+            exit 1
+          fi
+
+          echo "::group::Antes"
+          cat "${file_path}"
+          echo "::endgroup::"
+
+          # yq viene instalado en los runners ubuntu-latest de GitHub.
+          yq -i ".container.image.tag = \"${GIT_TAG}\"" "${file_path}"
+
+          if ! grep -q "tag: \"${GIT_TAG}\"" "${file_path}"; then
+            echo "::error::No se pudo actualizar el tag en ${file_path}"
+            exit 1
+          fi
+
+          echo "::group::Después"
+          cat "${file_path}"
+          echo "::endgroup::"
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          GIT_TAG: ${{ github.ref_name }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+
+      - name: Commit and push
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+          file_path="${REPOSITORY_NAME}/${ENVIRONMENT}/app.yaml"
+
+          git config user.name "${GIT_USER_NAME}"
+          git config user.email "${GIT_USER_EMAIL}"
+          git add "${file_path}"
+
+          if git diff --cached --quiet; then
+            echo "::notice::El tag ya estaba en ${GIT_TAG}; no hay nada que commitear."
+            exit 0
+          fi
+
+          git commit -m "chore(app.yaml): update image tag to ${GIT_TAG} in ${file_path}"
+
+          # Si otro despliegue hizo push al mismo tiempo, reintenta con rebase.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${GITOPS_BRANCH}"; then
+              echo "::notice::Commit enviado al repo GitOps. Argo CD lo verá en ~2 minutos."
+              exit 0
+            fi
+            echo "::warning::Push rechazado (intento ${attempt}); haciendo rebase"
+            git pull --rebase origin "${GITOPS_BRANCH}"
+          done
+
+          echo "::error::No se pudo hacer push al repo GitOps"
+          exit 1
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          GIT_TAG: ${{ github.ref_name }}
+          GIT_USER_EMAIL: ${{ inputs.git-user-email }}
+          GIT_USER_NAME: ${{ inputs.git-user-name }}
+          GITOPS_BRANCH: ${{ inputs.gitops-branch }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}

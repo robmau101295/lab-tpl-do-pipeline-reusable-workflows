@@ -1,0 +1,19 @@
+# Aprobación manual. El job usa un "environment" de GitHub (dev, qa, prod).
+# Si ese environment tiene "Required reviewers", el job se queda esperando
+# hasta que alguien apruebe. Equivale a reusable-workflows/approval.yml.
+name: Approval (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+
+jobs:
+  approval:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval completed
+        run: echo "::notice::Aprobado para ${{ inputs.environment }}"
